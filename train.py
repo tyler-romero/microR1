@@ -64,13 +64,12 @@ device_rollout_batch_size = 256  # number of completions to generate, in paralle
 group_size = 32  # number of completions per prompt (increasing leads to more fine-grained advantages)
 temperature = 0.7  # sampling temperature for response generation
 max_new_tokens = 512  # maximum length of generated responses
-max_prompt_tokens = 88  # maximum number of tokens in prompt before truncation
 ## learning stage
 policy_epochs = 1  # number of training epochs to run using the current rollout batch
 policy_update_batch_size = 16  # training batch size
 clip_epsilon = 0.2  # clipping parameter for the policy ratio
-beta_kld = 0.04  # initial KL penalty coefficient (provides regularization)
 adaptive_kl_penalty = False  # whether or not to adaptively adjust beta_kld
+beta_kld = 0.04  # initial KL penalty coefficient (provides regularization)
 # optimizer (adam)
 learning_rate = 5e-6
 weight_decay = 0.0
@@ -80,7 +79,7 @@ grad_clip = 0.5
 # learning rate decay
 decay_lr = True
 warmup_iters = 1000
-lr_decay_iters = 60000
+lr_decay_iters = 30000
 min_lr = learning_rate / 1000
 # DDP settings
 backend = 'nccl'  # 'nccl', 'gloo', etc.
@@ -130,7 +129,7 @@ assert device_rollout_batch_size > 0
 assert group_size > 1
 assert temperature > 0
 assert device_episodes_per_rollout % device_rollout_batch_size == 0
-assert device_episodes_per_rollout % device_policy_update_batch_size == 0
+# assert device_episodes_per_rollout % device_policy_update_batch_size == 0
 
 def print0(*args, **kwargs):
     if master_process:
@@ -201,7 +200,7 @@ if grad_scaling_enabled:
 scaler = torch.amp.GradScaler(device=device_type, enabled=grad_scaling_enabled)
 
 # optimizer
-optimizer = torch.optim.AdamW(model.parameters(), learning_rate, (beta1, beta2), weight_decay=weight_decay)
+optimizer = torch.optim.AdamW(model.parameters(), learning_rate, (beta1, beta2), weight_decay=weight_decay, fused=True)
 
 # learning rate decay scheduler using LambdaLR
 def get_lr(it):
@@ -232,8 +231,6 @@ def generate_completions(model, tokenizer, prompts, group_size, max_new_tokens, 
         prompts = [prompts]
     prompt_inputs = tokenizer(prompts, return_tensors='pt', padding=True).to(model.device)
     prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
-    prompt_ids = prompt_ids[:, -max_prompt_tokens :]
-    prompt_mask = prompt_mask[:, -max_prompt_tokens :]
 
     # disable gradient checkpointing and set model to eval mode for generation
     model.gradient_checkpointing_disable()
@@ -256,22 +253,23 @@ def generate_completions(model, tokenizer, prompts, group_size, max_new_tokens, 
     prompt_mask = prompt_mask.repeat_interleave(group_size, dim=0)
     return full_ids, prompt_length, prompt_mask
 
-def get_per_token_logprobs(model, input_ids, attention_mask, batch_size=512):
+@torch.compile(dynamic=True)
+def selective_log_softmax(logits, index):
+    logprobs = logits.log_softmax(dim=-1)
+    return torch.gather(logprobs, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+
+def get_per_token_logprobs(model, input_ids, attention_mask, logits_to_keep, batch_size=512):
     per_token_logprobs = []
     with ctx:
         for batch_input_ids, batch_attention_mask in zip(input_ids.split(batch_size), attention_mask.split(batch_size)):
-            logits = model(input_ids=batch_input_ids, attention_mask=batch_attention_mask).logits
-            # align inputs and outputs by shifting: remove start token for inputs and remove last logit
-            batch_input_ids = batch_input_ids[:, 1:]  # remove first token
-            logits = logits[:, :-1, :]
-
-            # Compute the log probabilities for the input tokens.
-            token_logits = logits.gather(dim=-1, index=batch_input_ids.unsqueeze(-1)).squeeze(-1)
-            # use a loop to reduce memory peak
-            lse = torch.stack([torch.logsumexp(l, dim=-1) for l in logits])
-            token_log_probs = token_logits - lse  # log_softmax = logits - log(sum(exp(logits)))
-            per_token_logprobs.append(token_log_probs)
-        return torch.cat(per_token_logprobs)
+            logits = model(  # num_logits_to_keep changes to logits_to_keep in transformers 4.49
+                input_ids=batch_input_ids, attention_mask=batch_attention_mask, num_logits_to_keep=logits_to_keep + 1
+            ).logits
+            logits = logits[:, :-1, :]  # exclude logits for the next token prediction
+            logits = logits[:, -logits_to_keep:]
+            batch_input_ids = batch_input_ids[:, -logits_to_keep:]
+            per_token_logprobs.append(selective_log_softmax(logits, batch_input_ids))
+        return torch.cat(per_token_logprobs, dim=0)
 
 def pad_and_stack(tensors: list, pad_value: int):
     max_len = max(x.size(1) for x in tensors)
@@ -288,12 +286,13 @@ def free_up_memory():
 
 @dataclass
 class Episode:
-    token_ids: torch.LongTensor
-    attention_mask: torch.IntTensor  # prompt + completion mask (for model forward pass)
-    loss_mask: torch.IntTensor       # completion-only mask (for loss computation)
+    prompt_ids: torch.LongTensor
+    prompt_mask: torch.IntTensor
+    completion_ids: torch.LongTensor
+    completion_mask: torch.IntTensor
     advantage: torch.FloatTensor
-    ref_lps: torch.FloatTensor
-    old_lps: torch.FloatTensor
+    ref_logprobs: torch.FloatTensor
+    old_logprobs: torch.FloatTensor
 
 class AdaptiveKLController:
     # https://github.com/openai/lm-human-preferences/blob/cbfd210bb8b08f6bc5c26878c10984b90f516c66/lm_human_preferences/train_policy.py#L115
@@ -328,11 +327,19 @@ def accuracy_reward_fn(texts, eval_fn):
     return torch.tensor(accuracy_rewards, device=device)
 
 def format_reward_fn(texts):
-    format_rewards = [
-        # pattern must exist exactly twice, once in system prompt, once in response
-        1.0 if len(re.findall(r'<think>.*?</think>\s*<answer>.*?</answer>', text, re.DOTALL)) == 2 else 0.0
-        for text in texts
-    ]
+    format_rewards = []
+    for text in texts:
+        has_correct_pattern = bool(re.search(r'<think>.*?</think>\s*<answer>.*?</answer>', text, re.DOTALL))
+        reward = 1.0 if has_correct_pattern else 0.0
+
+        think_pairs = len(re.findall(r'<think>.*?</think>', text, re.DOTALL))
+        answer_pairs = len(re.findall(r'<answer>.*?</answer>', text, re.DOTALL))
+        if think_pairs > 1:
+            reward -= 0.2
+        if answer_pairs > 1:
+            reward -= 0.2
+        format_rewards.append(reward)
+
     return torch.tensor(format_rewards, device=device)
 
 # -----------------------------------------------------------------------------
@@ -384,6 +391,7 @@ for rollout in range(total_rollouts):
             prompt_ids = full_ids[:, :prompt_length]
             completion_ids = full_ids[:, prompt_length:]
             full_text = tokenizer.batch_decode(full_ids, skip_special_tokens=True)
+            completion_text = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
 
             # mask everything after the first EOS token
             is_eos = completion_ids == tokenizer.eos_token_id
@@ -395,19 +403,19 @@ for rollout in range(total_rollouts):
             query_lengths.extend(prompt_mask.sum(dim=1).tolist())
             response_lengths.extend(completion_mask.sum(dim=1).tolist())
             attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-            loss_mask = torch.cat([torch.zeros_like(prompt_mask), completion_mask], dim=1)
+            logits_to_keep = completion_mask.size(1)
 
             # compute log probabilities - static during learning phase
             ref_model.to(device)
-            ref_lp = get_per_token_logprobs(ref_model, full_ids, attention_mask, batch_size=8)  # process in small batches to avoid OOM
+            ref_logprob = get_per_token_logprobs(ref_model, full_ids, attention_mask, logits_to_keep=logits_to_keep, batch_size=8)  # process in small batches to avoid OOM
             ref_model.cpu()
-            old_lp = get_per_token_logprobs(model, full_ids, attention_mask, batch_size=8)
+            old_logprob = get_per_token_logprobs(model, full_ids, attention_mask, logits_to_keep=logits_to_keep, batch_size=8)
 
             # compute rewards and group-relative advantages
             for k, eval_fn in enumerate(eval_fn_batch):
                 start = k * group_size
                 end = start + group_size
-                group_text = full_text[start:end]
+                group_text = completion_text[start:end]
 
                 group_acc_rewards = accuracy_reward_fn(group_text, eval_fn)
                 group_fmt_rewards = format_reward_fn(group_text)
@@ -417,12 +425,13 @@ for rollout in range(total_rollouts):
 
                 episodes.extend([
                     Episode(
-                        token_ids=full_ids[i : i + 1],
-                        attention_mask=attention_mask[i : i + 1],
-                        loss_mask=loss_mask[i : i + 1],
+                        prompt_ids=prompt_ids[i : i + 1],
+                        prompt_mask=prompt_mask[i : i + 1],
+                        completion_ids=completion_ids[i : i + 1],
+                        completion_mask=completion_mask[i : i + 1],
                         advantage=group_advantages[i - start],
-                        ref_lps=ref_lp[i : i + 1],
-                        old_lps=old_lp[i : i + 1],
+                        ref_logprobs=ref_logprob[i : i + 1],
+                        old_logprobs=old_logprob[i : i + 1],
                     )
                     for i in range(start, end)
                 ])
@@ -465,7 +474,8 @@ for rollout in range(total_rollouts):
             print0("========================")
 
     # clean up temporary variables that are using gpu memory
-    del full_ids, ref_lp, old_lp, attention_mask, loss_mask   # type: ignore
+    del full_ids, ref_logprob, old_logprob, attention_mask, prompt_ids, prompt_mask  # type: ignore
+    del completion_ids, completion_mask, group_advantages, is_eos, eos_idx, sequence_indices   # type: ignore
     free_up_memory()
 
     # -----------------------------------------------------------------------------------
@@ -480,31 +490,36 @@ for rollout in range(total_rollouts):
             batch = episodes[batch_start:batch_end]
 
             # form batch tensors from individual episodes
-            batch_ids = pad_and_stack([t.token_ids for t in batch], pad_value=tokenizer.pad_token_id)
-            batch_attention_mask = pad_and_stack([t.attention_mask for t in batch], pad_value=0)
-            batch_loss_mask = pad_and_stack([t.loss_mask for t in batch], pad_value=0)
-            batch_ref_lps = pad_and_stack([t.ref_lps for t in batch], pad_value=1)  # log(1) = 0
-            batch_old_lps = pad_and_stack([t.old_lps for t in batch], pad_value=1)
+            batch_prompt_ids = pad_and_stack([t.prompt_ids for t in batch], pad_value=tokenizer.pad_token_id)
+            batch_prompt_mask = pad_and_stack([t.prompt_mask for t in batch], pad_value=0)
+            batch_completion_ids = pad_and_stack([t.completion_ids for t in batch], pad_value=tokenizer.pad_token_id)
+            batch_completion_mask = pad_and_stack([t.completion_mask for t in batch], pad_value=0)
+
+            batch_ref_logprobs = pad_and_stack([t.ref_logprobs for t in batch], pad_value=1)  # log(1) = 0
+            batch_old_logprobs = pad_and_stack([t.old_logprobs for t in batch], pad_value=1)
             batch_advantages = torch.stack([t.advantage for t in batch]).unsqueeze(1)
+
+            batch_ids = torch.cat([batch_prompt_ids, batch_completion_ids], dim=1)
+            batch_attention_mask = torch.cat([batch_prompt_mask, batch_completion_mask], dim=1)
+            logits_to_keep = batch_completion_ids.size(1)
 
             # compute loss
             with ctx:
                 # compute new log probs and policy ratios
-                new_lp = get_per_token_logprobs(model, batch_ids, attention_mask=batch_attention_mask, batch_size=2)
-                policy_ratio = torch.exp(new_lp - batch_old_lps)
+                new_logprobs = get_per_token_logprobs(model, batch_ids, attention_mask=batch_attention_mask, logits_to_keep=logits_to_keep, batch_size=2)
 
                 # compute ppo-style surrogate losses using group-relative advantages
+                policy_ratio = torch.exp(new_logprobs - batch_old_logprobs)
                 surrogate1 = policy_ratio * batch_advantages
                 surrogate2 = torch.clamp(policy_ratio, 1 - clip_epsilon, 1 + clip_epsilon) * batch_advantages
                 grpo_loss = -torch.min(surrogate1, surrogate2)
 
                 # apply per-token KL divergence penalties; http://joschu.net/blog/kl-approx.html
-                kld_ref = torch.exp(batch_ref_lps - new_lp) - (batch_ref_lps - new_lp) - 1
+                kld_ref = torch.exp(batch_ref_logprobs - new_logprobs) - (batch_ref_logprobs - new_logprobs) - 1
                 grpo_loss = grpo_loss + kl_ctl.value * kld_ref
 
                 # mask and mean the loss, account for completion length so completions are weighted equally
-                batch_loss_mask = batch_loss_mask[:, 1:]  # remove first token index
-                grpo_loss = (grpo_loss * batch_loss_mask).sum(dim=1) / batch_loss_mask.sum(dim=1)
+                grpo_loss = (grpo_loss * batch_completion_mask).sum(dim=1) / batch_completion_mask.sum(dim=1)
                 grpo_loss = grpo_loss.mean()
 
             # backward pass, with gradient scaling if training in fp16
@@ -524,14 +539,15 @@ for rollout in range(total_rollouts):
                 lr = lr_scheduler.get_lr()[0]
                 lr_scheduler.step()
                 kl_coef = kl_ctl.value
-                kl_ctl.update(masked_mean(kld_ref, batch_loss_mask).item(), policy_update_batch_size)  # adaptively update kl penalty
+                kl_ctl.update(masked_mean(kld_ref, batch_completion_mask).item(), policy_update_batch_size)  # adaptively update kl penalty
 
                 # compute diagnostics
-                kld_old = torch.exp(batch_old_lps - new_lp) - (batch_old_lps - new_lp) - 1
-                kl_old = masked_mean(kld_old, batch_loss_mask).item()
-                kl_ref = masked_mean(kld_ref, batch_loss_mask).item()
+                kld_old = torch.exp(batch_old_logprobs - new_logprobs) - (batch_old_logprobs - new_logprobs) - 1
+                # TODO: double check these masked means
+                kl_old = masked_mean(kld_old, batch_completion_mask).item()
+                kl_ref = masked_mean(kld_ref, batch_completion_mask).item()
 
-                valid_policy_ratio = policy_ratio[batch_loss_mask.bool()]
+                valid_policy_ratio = policy_ratio[batch_completion_mask.bool()]
                 clipfrac = (((valid_policy_ratio < 1 - clip_epsilon) | (valid_policy_ratio > 1 + clip_epsilon)).float().mean())
 
                 loss = grpo_loss.item()
@@ -570,7 +586,10 @@ for rollout in range(total_rollouts):
                     )
 
     # clean up temporary variables that are using gpu memory
-    del episodes
+    del episodes, batch_old_logprobs, new_logprobs, batch_completion_mask, batch_prompt_mask
+    del policy_ratio, valid_policy_ratio, kld_old, kld_ref
+    del batch_prompt_ids, batch_completion_ids, batch_ids, batch_attention_mask, batch_ref_logprobs, batch_advantages
+    del surrogate1, surrogate2, grpo_loss
     free_up_memory()
 
 if ddp:

@@ -5,9 +5,15 @@ from random import choice, randint
 system_prompt = (
     "Respond in the following format: <think> ... </think> <answer> ... </answer>"
 )
+system_prompt_qwen = (
+    "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+)
 
-def make_messages(prompt):
-    return [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': prompt}]
+def make_messages(prompt, append_system_to_user: bool = True):
+    if append_system_to_user:
+        return [{'role': 'system', 'content': system_prompt_qwen}, {'role': 'user', 'content': prompt + "\n" + system_prompt}]
+    else:
+        return [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': prompt}]
 
 # ------------------------------------------------------------------------------------------------
 # Countdown Task
@@ -67,8 +73,8 @@ def evaluate_countdown_solution(solution: str, target: int, numbers: list[int]) 
 # ------------------------------------------------------------------------------------------------
 # Linear Equation Task
 def make_linear_equation_example(
-    max_coefficient: int = 50,
-    max_constant: int = 50,
+    max_coefficient: int = 25,
+    max_constant: int = 25,
 ):
     """Generate example for linear equation solving task.
 
@@ -91,8 +97,8 @@ def make_linear_equation_example(
         equation = f"{left_side} = {right_side}"
 
         prompt = (
-            f"Solve for x in the equation: {equation}\n"
-            "Answer with just the number (the value of x)."
+            f"Find the value of x that makes this equation true: {equation}\n"
+            "Provide only the numerical value for x without any other text or symbols."
         )
 
         messages = make_messages(prompt)
@@ -108,7 +114,7 @@ def evaluate_linear_equation_solution(solution: str, x_value: int) -> bool:
 
 # ------------------------------------------------------------------------------------------------
 # Single-pile Nim
-def make_single_pile_nim_example(max_pile_size: int = 50, max_pickup: int = 3):
+def make_single_pile_nim_example(max_pile_size: int = 25, max_pickup: int = 3):
     pile = randint(max_pickup + 2, max_pile_size)
     pickup = randint(2, max_pickup)
 
@@ -128,7 +134,7 @@ def evaluate_nim_solution(solution, optimal_move):
 
 # ------------------------------------------------------------------------------------------------
 # Josephus Problem
-def make_josephus_example(min_people: int = 5, max_people: int = 20, min_k: int = 2, max_k: int = 7):
+def make_josephus_example(min_people: int = 4, max_people: int = 20, min_k: int = 2, max_k: int = 5):
     # Randomly choose number of people and the step size
     n = randint(min_people, max_people)
     k = randint(min_k, max_k)
@@ -142,9 +148,11 @@ def make_josephus_example(min_people: int = 5, max_people: int = 20, min_k: int 
     safe_position = josephus(n, k)
 
     prompt = (
-        f"Josephus problem: In a circle of {n} people numbered 1 through {n}, every {k}{suffix} person "
-        f"is eliminated in order until only one person remains. Which position should you stand in to "
-        f"be the last remaining person? Answer with a number."
+        f"In a circle of {n} people numbered 1 through {n}, people are eliminated in a specific pattern. "
+        f"Starting from position 1 and counting clockwise, every {k}{suffix} person is eliminated. "
+        f"This continues around the circle until only one person survives. "
+        f"Which position (1 through {n}) should you stand in to be the last survivor? "
+        f"Answer with just the number of your chosen position."
     )
 
     messages = make_messages(prompt)
