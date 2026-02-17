@@ -2,7 +2,7 @@
 # Tested on a 2x4090 node.
 #
 # launch as the following (e.g. in a screen session) and wait ~1 days:
-# $ torchrun --standalone --nproc_per_node=8 train.py config/train_rtx4090.py
+# $ torchrun --standalone --nproc_per_node=2 train.py config/train_rtx4090.py
 
 wandb_log = True
 wandb_run_name='r1-qwen2p5-1p5B-instruct'

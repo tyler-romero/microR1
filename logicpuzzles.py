@@ -80,6 +80,8 @@ def make_linear_equation_example(
         x_value = randint(-10, 10)
         coefficient = randint(1, max_coefficient)
         constant = randint(-max_constant, max_constant)
+        if constant == 0:
+            continue  # avoid unnatural equations like "5x + 0 = 10"
 
         # Calculate the right side of the equation
         right_side = coefficient * x_value + constant
@@ -108,7 +110,7 @@ def evaluate_linear_equation_solution(solution: str, x_value: int) -> bool:
 # Single-pile Nim
 def make_single_pile_nim_example(max_pile_size: int = 50, max_pickup: int = 3):
     pile = randint(max_pickup + 2, max_pile_size)
-    pickup = randint(3, max_pickup)
+    pickup = randint(2, max_pickup)
 
     # For single pile Nim with max pickup limit, optimal strategy is to leave
     # (pickup + 1) stones or its multiples to force opponent into bad position

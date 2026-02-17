@@ -123,6 +123,7 @@ else:
     ddp_world_size = 1
     device_episodes_per_rollout = episodes_per_rollout
     device_policy_update_batch_size = policy_update_batch_size
+    assert device_rollout_batch_size % group_size == 0
     device_prompts_per_batch = device_rollout_batch_size // group_size
 
 assert device_rollout_batch_size > 0
@@ -147,6 +148,7 @@ if master_process:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(5492 + seed_offset)
 random.seed(5492 + seed_offset)
+np.random.seed(5492 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
@@ -269,7 +271,7 @@ def get_per_token_logprobs(model, input_ids, attention_mask, batch_size=512):
             lse = torch.stack([torch.logsumexp(l, dim=-1) for l in logits])
             token_log_probs = token_logits - lse  # log_softmax = logits - log(sum(exp(logits)))
             per_token_logprobs.append(token_log_probs)
-        return torch.stack(per_token_logprobs)
+        return torch.cat(per_token_logprobs)
 
 def pad_and_stack(tensors: list, pad_value: int):
     max_len = max(x.size(1) for x in tensors)
@@ -287,7 +289,8 @@ def free_up_memory():
 @dataclass
 class Episode:
     token_ids: torch.LongTensor
-    loss_mask: torch.IntTensor
+    attention_mask: torch.IntTensor  # prompt + completion mask (for model forward pass)
+    loss_mask: torch.IntTensor       # completion-only mask (for loss computation)
     advantage: torch.FloatTensor
     ref_lps: torch.FloatTensor
     old_lps: torch.FloatTensor
@@ -305,14 +308,14 @@ class AdaptiveKLController:
         mult = 1 + proportional_error * n_steps / self.horizon
         self.value *= mult
 
-class ConstantKLContriller:
+class ConstantKLController:
     def __init__(self, init_kl_coef):
         self.value = init_kl_coef
 
     def update(self, *args, **kwargs):
         pass
 
-kl_ctl = AdaptiveKLController(beta_kld, horizon=policy_update_batch_size * 5) if adaptive_kl_penalty else ConstantKLContriller(beta_kld)
+kl_ctl = AdaptiveKLController(beta_kld, horizon=policy_update_batch_size * 5) if adaptive_kl_penalty else ConstantKLController(beta_kld)
 
 # -----------------------------------------------------------------------------
 # reward function definitions
@@ -391,13 +394,14 @@ for rollout in range(total_rollouts):
 
             query_lengths.extend(prompt_mask.sum(dim=1).tolist())
             response_lengths.extend(completion_mask.sum(dim=1).tolist())
-            loss_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+            attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+            loss_mask = torch.cat([torch.zeros_like(prompt_mask), completion_mask], dim=1)
 
             # compute log probabilities - static during learning phase
             ref_model.to(device)
-            ref_lp = get_per_token_logprobs(ref_model, full_ids, loss_mask, batch_size=8)  # process in small batches to avoid OOM
+            ref_lp = get_per_token_logprobs(ref_model, full_ids, attention_mask, batch_size=8)  # process in small batches to avoid OOM
             ref_model.cpu()
-            old_lp = get_per_token_logprobs(model, full_ids, loss_mask, batch_size=8)
+            old_lp = get_per_token_logprobs(model, full_ids, attention_mask, batch_size=8)
 
             # compute rewards and group-relative advantages
             for k, eval_fn in enumerate(eval_fn_batch):
@@ -414,6 +418,7 @@ for rollout in range(total_rollouts):
                 episodes.extend([
                     Episode(
                         token_ids=full_ids[i : i + 1],
+                        attention_mask=attention_mask[i : i + 1],
                         loss_mask=loss_mask[i : i + 1],
                         advantage=group_advantages[i - start],
                         ref_lps=ref_lp[i : i + 1],
@@ -460,7 +465,7 @@ for rollout in range(total_rollouts):
             print0("========================")
 
     # clean up temporary variables that are using gpu memory
-    del full_ids, ref_lp, old_lp, loss_mask   # type: ignore
+    del full_ids, ref_lp, old_lp, attention_mask, loss_mask   # type: ignore
     free_up_memory()
 
     # -----------------------------------------------------------------------------------
@@ -468,14 +473,15 @@ for rollout in range(total_rollouts):
     # -----------------------------------------------------------------------------------
     for epoch in range(policy_epochs):
         random.shuffle(episodes)
-        for batch_start in range(0, len(episodes), policy_update_batch_size):
+        for batch_start in range(0, len(episodes), device_policy_update_batch_size):
             torch.cuda.reset_peak_memory_stats(device)
             t0 = time.time()
-            batch_end = min(batch_start + policy_update_batch_size, len(episodes))
+            batch_end = min(batch_start + device_policy_update_batch_size, len(episodes))
             batch = episodes[batch_start:batch_end]
 
             # form batch tensors from individual episodes
             batch_ids = pad_and_stack([t.token_ids for t in batch], pad_value=tokenizer.pad_token_id)
+            batch_attention_mask = pad_and_stack([t.attention_mask for t in batch], pad_value=0)
             batch_loss_mask = pad_and_stack([t.loss_mask for t in batch], pad_value=0)
             batch_ref_lps = pad_and_stack([t.ref_lps for t in batch], pad_value=1)  # log(1) = 0
             batch_old_lps = pad_and_stack([t.old_lps for t in batch], pad_value=1)
@@ -484,7 +490,7 @@ for rollout in range(total_rollouts):
             # compute loss
             with ctx:
                 # compute new log probs and policy ratios
-                new_lp = get_per_token_logprobs(model, batch_ids, attention_mask=batch_loss_mask, batch_size=2)
+                new_lp = get_per_token_logprobs(model, batch_ids, attention_mask=batch_attention_mask, batch_size=2)
                 policy_ratio = torch.exp(new_lp - batch_old_lps)
 
                 # compute ppo-style surrogate losses using group-relative advantages
