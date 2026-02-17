@@ -12,7 +12,7 @@ checkpoint_path = 'Qwen/Qwen2.5-3B-Instruct'
 _num_devices = 8
 
 device_rollout_batch_size = 128
-episodes_per_rollout = device_rollout_batch_size * _num_devicess
+episodes_per_rollout = device_rollout_batch_size * _num_devices
 group_size = 16
 policy_epochs = 1
 policy_update_batch_size = 4 * _num_devices
