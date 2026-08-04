@@ -54,6 +54,7 @@ wandb_project = 'r1'
 wandb_run_name = 'r1-' + str(int(time.time()))
 # dataset
 tasks = "all"  # eg "countdown", or "countdown,nim"
+task_preset = 'default'  # prompt style and task difficulty preset from logicpuzzles.task_presets
 # training
 checkpoint_path = 'Qwen/Qwen2.5-1.5B-Instruct'
 total_rollouts = 1024
@@ -64,9 +65,10 @@ device_rollout_batch_size = 256  # number of completions to generate, in paralle
 group_size = 32  # number of completions per prompt (increasing leads to more fine-grained advantages)
 temperature = 0.7  # sampling temperature for response generation
 max_new_tokens = 512  # maximum length of generated responses
+max_prompt_tokens = 256  # maximum number of prompt tokens; set <= 0 to disable truncation
 ## learning stage
 policy_epochs = 1  # number of training epochs to run using the current rollout batch
-policy_update_batch_size = 16  # training batch size
+policy_update_batch_size = 16  # global training batch size across all DDP workers
 clip_epsilon = 0.2  # clipping parameter for the policy ratio
 adaptive_kl_penalty = False  # whether or not to adaptively adjust beta_kld
 beta_kld = 0.04  # initial KL penalty coefficient (provides regularization)
@@ -79,14 +81,14 @@ grad_clip = 0.5
 # learning rate decay
 decay_lr = True
 warmup_iters = 1000
-lr_decay_iters = 30000
+lr_decay_iters = 60000
 min_lr = learning_rate / 1000
 # DDP settings
 backend = 'nccl'  # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = False  # use PyTorch 2.0 compilation
+torch_compile = False  # compile the full model with PyTorch 2.0
 # -----------------------------------------------------------------------------
 # config overrides
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -129,7 +131,7 @@ assert device_rollout_batch_size > 0
 assert group_size > 1
 assert temperature > 0
 assert device_episodes_per_rollout % device_rollout_batch_size == 0
-# assert device_episodes_per_rollout % device_policy_update_batch_size == 0
+assert device_episodes_per_rollout % device_policy_update_batch_size == 0
 
 def print0(*args, **kwargs):
     if master_process:
@@ -162,7 +164,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # unlike in nanoGPT, we always want to start from a pretrained model
 print0("initializing model")
 tokenizer = AutoTokenizer.from_pretrained(checkpoint_path, padding_side='left')
-model = AutoModelForCausalLM.from_pretrained(checkpoint_path, torch_dtype=torch.bfloat16, attn_implementation='sdpa', device_map=None)
+model = AutoModelForCausalLM.from_pretrained(checkpoint_path, dtype=ptdtype, attn_implementation='sdpa', device_map=None)
 model.to(device)
 model.train()
 model.gradient_checkpointing_enable()
@@ -172,6 +174,7 @@ def update_reference_model(model):
     ref_model = deepcopy(model)
     for param in ref_model.parameters():  # ref model is fully frozen
         param.requires_grad = False
+    ref_model.gradient_checkpointing_disable()
     ref_model.eval()
     ref_model.cpu()  # keep out of GPU memory when not in use
     return ref_model
@@ -179,7 +182,7 @@ def update_reference_model(model):
 ref_model = update_reference_model(model)
 
 # compile the model
-if compile:
+if torch_compile:
     print0('compiling the model... (takes a ~minute)')
     torch._dynamo.config.optimize_ddp = False  # DDPOptimizer does not support higher order op in graph
     model.generation_config.cache_implementation = 'static'  # generation-time kv cache compatible with torch.compile
@@ -191,7 +194,7 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank], static_graph=True)
 
 # dataset
-dataset = logicpuzzles.gen_dataset(tasks)
+dataset = logicpuzzles.gen_dataset(tasks, task_preset=task_preset)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 grad_scaling_enabled = (dtype == 'float16')
@@ -200,7 +203,9 @@ if grad_scaling_enabled:
 scaler = torch.amp.GradScaler(device=device_type, enabled=grad_scaling_enabled)
 
 # optimizer
-optimizer = torch.optim.AdamW(model.parameters(), learning_rate, (beta1, beta2), weight_decay=weight_decay, fused=True)
+optimizer = torch.optim.AdamW(
+    model.parameters(), learning_rate, (beta1, beta2), weight_decay=weight_decay, fused=device_type == 'cuda'
+)
 
 # learning rate decay scheduler using LambdaLR
 def get_lr(it):
@@ -231,6 +236,9 @@ def generate_completions(model, tokenizer, prompts, group_size, max_new_tokens, 
         prompts = [prompts]
     prompt_inputs = tokenizer(prompts, return_tensors='pt', padding=True).to(model.device)
     prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+    if max_prompt_tokens > 0:
+        prompt_ids = prompt_ids[:, -max_prompt_tokens:]
+        prompt_mask = prompt_mask[:, -max_prompt_tokens:]
 
     # disable gradient checkpointing and set model to eval mode for generation
     model.gradient_checkpointing_disable()
@@ -253,6 +261,7 @@ def generate_completions(model, tokenizer, prompts, group_size, max_new_tokens, 
     prompt_mask = prompt_mask.repeat_interleave(group_size, dim=0)
     return full_ids, prompt_length, prompt_mask
 
+# See https://www.tylerromero.com/posts/2025-02-selective-log-softmax/
 @torch.compile(dynamic=True)
 def selective_log_softmax(logits, index):
     logprobs = logits.log_softmax(dim=-1)
@@ -262,8 +271,11 @@ def get_per_token_logprobs(model, input_ids, attention_mask, logits_to_keep, bat
     per_token_logprobs = []
     with ctx:
         for batch_input_ids, batch_attention_mask in zip(input_ids.split(batch_size), attention_mask.split(batch_size)):
-            logits = model(  # num_logits_to_keep changes to logits_to_keep in transformers 4.49
-                input_ids=batch_input_ids, attention_mask=batch_attention_mask, num_logits_to_keep=logits_to_keep + 1
+            logits = model(
+                input_ids=batch_input_ids,
+                attention_mask=batch_attention_mask,
+                use_cache=False,
+                logits_to_keep=logits_to_keep + 1,
             ).logits
             logits = logits[:, :-1, :]  # exclude logits for the next token prediction
             logits = logits[:, -logits_to_keep:]
@@ -409,7 +421,9 @@ for rollout in range(total_rollouts):
             ref_model.to(device)
             ref_logprob = get_per_token_logprobs(ref_model, full_ids, attention_mask, logits_to_keep=logits_to_keep, batch_size=8)  # process in small batches to avoid OOM
             ref_model.cpu()
+            raw_model.gradient_checkpointing_disable()
             old_logprob = get_per_token_logprobs(model, full_ids, attention_mask, logits_to_keep=logits_to_keep, batch_size=8)
+            raw_model.gradient_checkpointing_enable()
 
             # compute rewards and group-relative advantages
             for k, eval_fn in enumerate(eval_fn_batch):
@@ -486,7 +500,7 @@ for rollout in range(total_rollouts):
         for batch_start in range(0, len(episodes), device_policy_update_batch_size):
             torch.cuda.reset_peak_memory_stats(device)
             t0 = time.time()
-            batch_end = min(batch_start + device_policy_update_batch_size, len(episodes))
+            batch_end = batch_start + device_policy_update_batch_size
             batch = episodes[batch_start:batch_end]
 
             # form batch tensors from individual episodes
@@ -536,7 +550,7 @@ for rollout in range(total_rollouts):
 
             with torch.no_grad():
                 # step schedulers
-                lr = lr_scheduler.get_lr()[0]
+                lr = lr_scheduler.get_last_lr()[0]
                 lr_scheduler.step()
                 kl_coef = kl_ctl.value
                 kl_ctl.update(masked_mean(kld_ref, batch_completion_mask).item(), policy_update_batch_size)  # adaptively update kl penalty

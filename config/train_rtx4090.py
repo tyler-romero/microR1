@@ -8,6 +8,7 @@ wandb_log = True
 wandb_run_name='r1-qwen2p5-1p5B-instruct'
 
 checkpoint_path = 'Qwen/Qwen2.5-1.5B-Instruct'
+task_preset = 'qwen_4090'
 
 device_rollout_batch_size = 256
 group_size = 32
@@ -17,4 +18,8 @@ policy_epochs = 1
 
 max_new_tokens = 512
 
-policy_update_batch_size = 24 # 16
+# Global batch size across both DDP workers (16 examples per GPU).
+policy_update_batch_size = 32
+
+# Tuned for this shorter 4090 recipe rather than the generic training default.
+lr_decay_iters = 30000

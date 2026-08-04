@@ -6,7 +6,7 @@ A simple, fast repository for tuning (small) models using Group-Relative Policy 
 
 This repo was created in the image of Karpathy's lovely [nanoGPT](https://github.com/karpathy/nanoGPT) <3
 
-Still under active development, but currently the file `train.py` will train `Qwen2.5-3B-Instruct` from ~20% up to 95% accuracy on a set of dynamically generated logic and math tasks, running on a single 8xA100 80GB node in about 3 hours (costs $44 = $1.79 / GPU / hr * 8 GPU * 3 hr at the time of writing). If you have a consumer GPU like a 4090, then with some minor tweaks to configs (see below) you can train `Qwen2.5-1.5B-Instruct` from ~0% up to 45% accuracy in about 16 hours.
+Still under active development, but currently the file `train.py` will train `Qwen2.5-3B-Instruct` from ~20% up to 95% accuracy on a set of dynamically generated logic and math tasks, running on a single 8xA100 80GB node in about 3 hours (costs $44 = $1.79 / GPU / hr * 8 GPU * 3 hr at the time of writing). In archived 2xRTX 4090 experiments, `Qwen2.5-1.5B-Instruct` improved from roughly 29% initial rollout-batch accuracy to 80% or better late in training. Treat these noisy training-batch measurements as a reference rather than a controlled benchmark; the current recipe is in `config/train_rtx4090.py`.
 
 The primary goal of microR1 is to be a fully featured, yet simple and hackable implementation of the post-training algorithm described in the Deepseek-R1. The code is meant to be plain and readable: `train.py` is a ~550-line GRPO training loop and `logicpuzzles.py` is a ~150-line set of task definitions. There are minimal dependencies or abstractions hiding crucial bits of logic. Language modeling is handled by `transformers` because it provides some important quality-of-life features such as kv-caching during response generation and gradient checkpointing during training. Additionally, since GRPO begins with a pre-trained model, using `transformers` gives access to a huge variety of starting points.
 
@@ -24,26 +24,26 @@ Dependencies:
 - python >= 3.10
 - [pytorch](https://pytorch.org/) <3
 - [numpy](https://numpy.org/install/) <3
-- [transformers](https://github.com/huggingface/transformers) for huggingface transformers <3 (to load pretrained models and provide generation + gradient checkpointing utilities)
+- [transformers](https://github.com/huggingface/transformers) >=5.9,<6 (to load pretrained models and provide generation + gradient checkpointing utilities)
 - `wandb` for optional logging <3
 
 
 ## train a micro R1 model!
 
 ### I have a GPU
-Great, if you have an 8xA100 (40GB) node then you can simply train `Qwen-2.5-3B-Instruct` using the default config settings:
+Great, if you have an 8xA100 (40GB) node then you can train `Qwen-2.5-3B-Instruct` with:
 ```
-torchrun --standalone --nproc_per_node=8 train.py
+torchrun --standalone --nproc_per_node=8 train.py config/train_a100.py
 ```
 
-If you have a single 24GB consumer GPU, such as a 3090 or 4090, you can launch training of `Qwen-2.5-1.5B-Instruct` with the following command:
+`Qwen2.5-1.5B-Instruct` fits on a 24GB RTX 3090 or 4090. The included recipe is validated on two RTX 4090s:
 ```
-python train.py config/train_4090.py
+torchrun --standalone --nproc_per_node=2 train.py config/train_rtx4090.py
 ```
 
 If you have a GPU with less memory than a 4090, try sizing down the model. For example, you could train with `Qwen-2.5-0.5B-Instruct` using the following command:
 ```
-python train.py config/train_4090.py --checkpoint_path="Qwen-2.5-0.5B-Instruct"
+python train.py config/train_rtx4090.py --checkpoint_path="Qwen/Qwen2.5-0.5B-Instruct" --device_rollout_batch_size=128 --episodes_per_rollout=256 --policy_update_batch_size=16
 ```
 
 ### I'm willing to rent a GPU
